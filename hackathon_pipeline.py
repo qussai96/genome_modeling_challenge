@@ -1151,6 +1151,8 @@ def generate_candidates_with_beam_search(base_sequence: str, te_predictor: TEPre
     logger.info(f"  Best candidate fitness: {ranked_final[0][1]:.4f}")
     logger.info(f"  Embedding cache: {len(embedding_cache)} unique UTR sequences cached")
     logger.info("="*70 + "\n")
+    
+    return candidates
 
 
 class Config:
