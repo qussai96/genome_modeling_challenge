@@ -328,13 +328,14 @@ print(f"Predictions written to {output_path}")
     return result_df
 
 
-def generate_rna_embeddings(sequences: List[str], output_dir: Path) -> np.ndarray:
+def generate_rna_embeddings(sequences: List[str], output_dir: Path, cache_prefix: str = "temp") -> np.ndarray:
     """
     Generate RNA embeddings using RNA-FM foundation model.
     
     Args:
         sequences: List of RNA sequences (A, C, G, U)
         output_dir: Directory to save temporary files
+        cache_prefix: Prefix for cache file to avoid collisions (e.g., "training", "generation")
         
     Returns:
         np.ndarray of shape (N, 640) - RNA embeddings
@@ -392,8 +393,8 @@ def generate_rna_embeddings(sequences: List[str], output_dir: Path) -> np.ndarra
     if invalid_count > 0:
         logger.warning(f"RNA-FM input sanitized {invalid_count} non-ACGU characters")
 
-    # Check if cached embeddings exist
-    output_npz = output_dir / 'temp_rna_sequences.rnafm_embeddings.npz'
+    # Check if cached embeddings exist (use cache_prefix to avoid collisions)
+    output_npz = output_dir / f'{cache_prefix}_rna_sequences.rnafm_embeddings.npz'
     if output_npz.exists():
         logger.info(f"✓ Found cached RNA-FM embeddings at {output_npz}, skipping regeneration")
         # Load cached embeddings and pool them
@@ -734,7 +735,7 @@ def load_and_prepare_training_data(data_path: Path, output_dir: Path,
     
     # Generate RNA embeddings for UTRs
     logger.info("Generating RNA-FM embeddings for UTRs...")
-    rna_embeddings = generate_rna_embeddings(utrs, output_dir)
+    rna_embeddings = generate_rna_embeddings(utrs, output_dir, cache_prefix="training")
     logger.info(f"✓ Generated embeddings: {rna_embeddings.shape}")
     
     # Extract TE values for target and off-target cell types
@@ -958,7 +959,7 @@ def _predict_specificity_scores(
     # Generate embeddings only for uncached sequences (saves subprocess calls)
     if sequences_to_embed:
         logger.debug(f"Computing embeddings for {len(sequences_to_embed)} new sequences (cached {cached_count})")
-        new_embeddings = generate_rna_embeddings(sequences_to_embed, embedding_output_dir)
+        new_embeddings = generate_rna_embeddings(sequences_to_embed, embedding_output_dir, cache_prefix="generation")
         
         # Store in cache
         for idx, new_emb in zip(indices_to_embed, new_embeddings):
@@ -1785,7 +1786,7 @@ def main():
             
                 try:
                     # Generate RNA embeddings with RNA-FM
-                    rna_embeddings = generate_rna_embeddings(candidates, output_dir)
+                    rna_embeddings = generate_rna_embeddings(candidates, output_dir, cache_prefix="generation")
                     logger.info(f"✓ RNA embeddings shape: {rna_embeddings.shape}")
 
                     # Generate protein embeddings with ESM2
