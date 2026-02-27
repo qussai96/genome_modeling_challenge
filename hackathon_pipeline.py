@@ -392,6 +392,37 @@ def generate_rna_embeddings(sequences: List[str], output_dir: Path) -> np.ndarra
     if invalid_count > 0:
         logger.warning(f"RNA-FM input sanitized {invalid_count} non-ACGU characters")
 
+    # Check if cached embeddings exist
+    output_npz = output_dir / 'temp_rna_sequences.rnafm_embeddings.npz'
+    if output_npz.exists():
+        logger.info(f"✓ Found cached RNA-FM embeddings at {output_npz}, skipping regeneration")
+        # Load cached embeddings and pool them
+        data = np.load(output_npz, allow_pickle=True)
+        window_embeddings = data['embeddings'].astype(np.float32)
+
+        if len(window_parent_indices) != len(window_embeddings):
+            logger.warning(
+                f"Cache size mismatch: expected {len(window_parent_indices)} windows, "
+                f"found {len(window_embeddings)}. Regenerating embeddings."
+            )
+        else:
+            # Pool window embeddings back to one embedding per original sequence
+            n_original = len(normalized_sequences)
+            pooled = np.zeros((n_original, window_embeddings.shape[1]), dtype=np.float32)
+            counts = np.zeros(n_original, dtype=np.int32)
+
+            for w_idx, parent_idx in enumerate(window_parent_indices):
+                pooled[parent_idx] += window_embeddings[w_idx]
+                counts[parent_idx] += 1
+
+            if np.any(counts == 0):
+                missing = int((counts == 0).sum())
+                raise RuntimeError(f"Missing pooled embeddings for {missing} sequences")
+
+            embeddings = pooled / counts[:, None]
+            logger.info(f"✓ Loaded cached RNA embeddings: {embeddings.shape}")
+            return embeddings
+
     write_fasta(windowed_sequences, fasta_path, prefix="rna")
     
     # Create a custom script that processes the FASTA file with RNA-FM
@@ -509,8 +540,7 @@ np.savez(output_path, ids=np.array(all_ids, dtype=object), embeddings=embeddings
 print(f"Saved to {output_path}")
 ''')
     
-    # Run RNA-FM
-    output_npz = output_dir / 'temp_rna_sequences.rnafm_embeddings.npz'
+    # Run RNA-FM (output_npz already defined above for cache check)
     cmd = (
         f"conda run -p {Path.home() / 'anaconda3' / 'envs' / 'rnafm'} "
         f"python {custom_script} {fasta_path} {output_npz}"
