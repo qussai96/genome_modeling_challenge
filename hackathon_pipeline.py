@@ -752,6 +752,18 @@ def train_te_predictor(rna_embeddings: torch.Tensor, target_te: torch.Tensor,
     all_rna_embeddings = torch.cat([rna_embeddings, rna_embeddings], dim=0)
     all_te_values = torch.cat([target_te, offtarget_te], dim=0)
     all_cell_indices = torch.cat([cell_indices_target, cell_indices_offtarget], dim=0)
+
+    # Remove NaN/Inf labels to avoid unstable loss and missing checkpoints
+    finite_mask = torch.isfinite(all_te_values)
+    dropped = int((~finite_mask).sum().item())
+    if dropped > 0:
+        logger.warning(f"Dropping {dropped} TE labels with NaN/Inf before training")
+    all_rna_embeddings = all_rna_embeddings[finite_mask]
+    all_te_values = all_te_values[finite_mask]
+    all_cell_indices = all_cell_indices[finite_mask]
+
+    if len(all_te_values) < 10:
+        raise RuntimeError("Not enough finite TE labels to train TE predictor")
     
     # Create model with correct num_cells
     model = TEPredictorModel(num_cells=num_cells).to(device)
@@ -784,6 +796,10 @@ def train_te_predictor(rna_embeddings: torch.Tensor, target_te: torch.Tensor,
     best_val_loss = float('inf')
     patience = 5
     patience_counter = 0
+    best_model_path = output_dir / 'te_predictor_best.pt'
+
+    # Ensure a checkpoint always exists even if validation loss is NaN
+    torch.save(model.state_dict(), best_model_path)
     
     # Training loop
     for epoch in range(epochs):
@@ -811,6 +827,18 @@ def train_te_predictor(rna_embeddings: torch.Tensor, target_te: torch.Tensor,
         with torch.no_grad():
             val_pred = model(val_rna, val_cells)
             val_loss = criterion(val_pred, val_te).item()
+
+        if not np.isfinite(train_loss):
+            logger.warning(f"Epoch {epoch+1}: train loss is non-finite ({train_loss}); stopping early")
+            break
+
+        if not np.isfinite(val_loss):
+            logger.warning(f"Epoch {epoch+1}: val loss is non-finite ({val_loss}); keeping last best checkpoint")
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info(f"Early stopping at epoch {epoch+1}")
+                break
+            continue
         
         if (epoch + 1) % 5 == 0 or epoch == 0:
             logger.info(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
@@ -820,7 +848,7 @@ def train_te_predictor(rna_embeddings: torch.Tensor, target_te: torch.Tensor,
             best_val_loss = val_loss
             patience_counter = 0
             # Save best model
-            torch.save(model.state_dict(), output_dir / 'te_predictor_best.pt')
+            torch.save(model.state_dict(), best_model_path)
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -828,7 +856,7 @@ def train_te_predictor(rna_embeddings: torch.Tensor, target_te: torch.Tensor,
                 break
     
     # Load best model
-    model.load_state_dict(torch.load(output_dir / 'te_predictor_best.pt', map_location=device))
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
     logger.info(f"✓ TE Predictor training complete!")
     logger.info("="*70 + "\n")
     
@@ -1471,9 +1499,9 @@ def main():
     parser.add_argument('--ribonn-topk', type=int, default=5,
                        help='Top-k models per fold to average in RiboNN')
     parser.add_argument('--train-te-predictor', action='store_true',
-                       help='Train TE predictor from training data before generation')
+                       help='Deprecated: generation mode does not train TE predictor; use train_te_predictor.py')
     parser.add_argument('--te-predictor-model', type=str, default=None,
-                       help='Path to trained TE predictor model')
+                       help='Path to trained TE predictor checkpoint (.pt)')
     parser.add_argument('--use-ga', action='store_true', default=True,
                        help='Deprecated flag kept for compatibility; deterministic guided optimization is always used')
     parser.add_argument('--beam-width', type=int, default=100,
@@ -1481,7 +1509,7 @@ def main():
     parser.add_argument('--num-iterations', type=int, default=30,
                        help='Number of iterations for beam search optimization')
     parser.add_argument('--training-data', type=str, default=None,
-                       help='Path to training data file for TE predictor')
+                       help='Optional fallback training data path to derive cell mapping if missing in checkpoint')
     
     args = parser.parse_args()
     
@@ -1595,70 +1623,52 @@ def main():
             else:
                 logger.info(f"Using provided protein: {len(args.base_protein)} aa")
             
-            # Step 0: Load or train TE predictor (required)
-            te_predictor = None
-            training_data_path = args.ga_training_data or (Path(__file__).parent / 'raw_data' / '41587_2025_2712_MOESM3_ESM.xlsx')
+            # Step 0: Load TE predictor checkpoint (required, no in-generation training)
+            if not args.te_predictor_model:
+                raise RuntimeError(
+                    "--te-predictor-model is required for generation. "
+                    "Train once with train_te_predictor.py and reuse the saved checkpoint."
+                )
 
-            # Load trained TE predictor if path provided
-            if args.te_predictor_model:
-                try:
-                    # First, load the state dict to check num_cells
-                    state_dict = torch.load(args.te_predictor_model, map_location='cpu')
+            model_path = Path(args.te_predictor_model)
+            if not model_path.exists():
+                raise RuntimeError(f"TE predictor checkpoint not found: {model_path}")
+
+            try:
+                checkpoint = torch.load(model_path, map_location='cpu')
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    state_dict = checkpoint['model_state_dict']
+                    num_cells = int(checkpoint.get('num_cells', state_dict['cell_embeddings.weight'].shape[0]))
+                    cell_to_idx = checkpoint.get('cell_to_idx')
+                else:
+                    state_dict = checkpoint
                     num_cells = state_dict['cell_embeddings.weight'].shape[0]
-                    logger.info(f"Detected {num_cells} cell types from model checkpoint")
-                    
-                    te_predictor = TEPredictorModel(num_cells=num_cells)
-                    te_predictor.load_state_dict(state_dict)
-                    te_predictor.eval()
-                    logger.info(f"✓ Loaded TE predictor from {args.te_predictor_model}")
-                except Exception as e:
-                    logger.error(f"Failed to load TE predictor: {e}")
-                    te_predictor = None
+                    cell_to_idx = None
 
-            # Train predictor when no model was provided
-            if te_predictor is None:
+                logger.info(f"Detected {num_cells} cell types from model checkpoint")
+
+                te_predictor = TEPredictorModel(num_cells=num_cells)
+                te_predictor.load_state_dict(state_dict)
+                te_predictor = te_predictor.to(device)
+                te_predictor.eval()
+                logger.info(f"✓ Loaded TE predictor from {model_path}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to load TE predictor checkpoint '{model_path}': {e}")
+
+            # If checkpoint lacks cell mapping, fallback to training-data-derived mapping
+            if cell_to_idx is None:
+                training_data_path = args.training_data or (Path(__file__).parent / 'raw_data' / '41587_2025_2712_MOESM3_ESM.xlsx')
                 if not training_data_path.exists():
                     raise RuntimeError(
-                        f"Training data not found at {training_data_path}. "
-                        "Provide --ga-training-data or --te-predictor-model."
+                        "Checkpoint does not include cell mapping and training data is unavailable. "
+                        "Provide --training-data or retrain with train_te_predictor.py."
                     )
-
-                logger.info(f"Training TE predictor from {training_data_path}...")
-                
-                # Extract cell mapping from data first
+                logger.warning("Checkpoint missing cell mapping; deriving it from training data")
                 cell_to_idx = extract_cell_to_idx_mapping(training_data_path)
-                num_cells = len(cell_to_idx)
-                logger.info(f"Found {num_cells} cell types in training data")
-                
-                rna_embeddings, target_te, offtarget_te, cell_indices, _ = load_and_prepare_training_data(
-                    training_data_path,
-                    output_dir,
-                    args.target_cell,
-                    args.offtarget_cell,
-                    cell_to_idx=cell_to_idx,
-                    sample_size=5000
-                )
-
-                te_predictor = train_te_predictor(
-                    rna_embeddings,
-                    target_te,
-                    offtarget_te,
-                    cell_indices,
-                    output_dir,
-                    num_cells=num_cells,
-                    epochs=30,
-                    batch_size=64
-                )
-
-                torch.save(te_predictor.state_dict(), output_dir / 'te_predictor_final.pt')
-                logger.info(f"✓ Saved TE predictor to {output_dir / 'te_predictor_final.pt'}")
-                args.te_predictor_model = str(output_dir / 'te_predictor_final.pt')
 
             # Step 1: Generate candidate sequences (deterministic guided optimization)
             logger.info("Using deterministic TE-guided UTR optimization for candidate generation...")
 
-            # Extract cell type mapping from training data for candidate generation
-            cell_to_idx = extract_cell_to_idx_mapping(training_data_path)
             logger.info(f"Available cell types for generation: {len(cell_to_idx)}")
             
             # Get cell IDs from mapping

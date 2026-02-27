@@ -29,6 +29,7 @@
 # ============================================================================
 
 set -e  # Exit on error
+set -o pipefail
 
 echo "================================================================================"
 echo "  SEROVA CHALLENGE - Hackathon Submission"
@@ -51,6 +52,10 @@ echo ""
 PROJECT_DIR="/home/students/q.abbas/+proj-q.abbas/genome_modeling"
 LOG_DIR="${PROJECT_DIR}/fibroblast_vs_neurons/logs"
 RESULTS_DIR="${PROJECT_DIR}/fibroblast_vs_neurons"
+TRAINING_DATA="${PROJECT_DIR}/raw_data/41587_2025_2712_MOESM3_ESM.xlsx"
+TARGET_CELL="TE_neurons"
+OFFTARGET_CELL="TE_fibroblast"
+TE_MODEL_PATH="${RESULTS_DIR}/te_predictor__${TARGET_CELL}__vs__${OFFTARGET_CELL}.pt"
 
 # Create directories
 mkdir -p "$RESULTS_DIR"
@@ -99,13 +104,31 @@ echo "" | tee -a "$LOG_FILE"
 echo "Starting Hackathon Pipeline..." | tee -a "$LOG_FILE"
 echo "" | tee -a "$LOG_FILE"
 
+# Ensure TE predictor model exists (train once, reuse many times)
+if [ -f "$TE_MODEL_PATH" ]; then
+    echo "✓ Found TE predictor checkpoint: $TE_MODEL_PATH" | tee -a "$LOG_FILE"
+else
+    echo "TE predictor checkpoint not found. Training now..." | tee -a "$LOG_FILE"
+    python train_te_predictor.py \
+        --training-data "$TRAINING_DATA" \
+        --output-model "$TE_MODEL_PATH" \
+        --work-dir "$RESULTS_DIR" \
+        --target-cell "$TARGET_CELL" \
+        --offtarget-cell "$OFFTARGET_CELL" \
+        2>&1 | tee -a "$LOG_FILE"
+    echo "✓ TE predictor training completed: $TE_MODEL_PATH" | tee -a "$LOG_FILE"
+fi
+
+echo "" | tee -a "$LOG_FILE"
+
 # Generate sequences with RiboNN data
 python hackathon_pipeline.py \
     --mode generate \
-    --data "${PROJECT_DIR}/raw_data/41587_2025_2712_MOESM3_ESM.xlsx" \
+    --te-predictor-model "$TE_MODEL_PATH" \
+    --training-data "$TRAINING_DATA" \
     --output-dir "$RESULTS_DIR" \
-    --target-cell "TE_neurons" \
-    --offtarget-cell "TE_fibroblast" \
+    --target-cell "$TARGET_CELL" \
+    --offtarget-cell "$OFFTARGET_CELL" \
     2>&1 | tee -a "$LOG_FILE"
 
 PIPELINE_EXIT_CODE=$?
